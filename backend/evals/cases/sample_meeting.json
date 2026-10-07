@@ -1,0 +1,16 @@
+{
+  "title": "Product Roadmap & Security Sync",
+  "attendees": ["Priya", "Rahul", "Alex"],
+  "meeting_date": "2026-10-07",
+  "transcript": "Priya: Welcome everyone. Let's discuss the product roadmap for Q4.\nRahul: I will prepare the financial forecast slides by next Friday.\nPriya: Great. Also, Alex, can you review the security audit document by Wednesday?\nAlex: Sure, I will review the security audit document by Wednesday.\nPriya: Perfect. Let's make sure we launch the beta by end of month.",
+  "expected_action_items": [
+    {
+      "task": "Prepare financial forecast slides",
+      "owner": "Rahul"
+    },
+    {
+      "task": "Review security audit document",
+      "owner": "Alex"
+    }
+  ]
+}

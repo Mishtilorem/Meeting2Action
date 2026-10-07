@@ -1,24 +1,36 @@
-import os
-import psycopg
+import os, uuid, shutil, tempfile
+from contextlib import asynccontextmanager
+from typing import Literal, Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-
 load_dotenv()
 
-app = FastAPI(title="Meeting-to-Action API", version="1.0.0")
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from langgraph.checkpoint.postgres import PostgresSaver
 
+import pipeline
+from db import conn, audit
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db_url = os.environ.get("DATABASE_URL", "")
+    if db_url and "user:password" not in db_url:
+        with PostgresSaver.from_conn_string(db_url) as saver:
+            saver.setup()
+            pipeline.init(saver)
+            yield
+    else:
+        # Fallback for development before Postgres URL is added
+        yield
+
+app = FastAPI(title="Meeting-to-Action API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], allow_headers=["*"],
 )
-
-@app.get("/")
-def read_root():
-    return {"message": "Meeting-to-Action API is running."}
 
 @app.get("/health")
 def health():
@@ -29,12 +41,76 @@ def health():
             "db": "not_configured",
             "message": "DATABASE_URL is using placeholder. Provide a valid Neon or Supabase connection string in backend/.env"
         }
-    
     try:
-        with psycopg.connect(db_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                res = cur.fetchone()
+        with conn() as c:
+            c.execute("SELECT 1")
         return {"status": "ok", "db": "connected"}
     except Exception as e:
-        return {"status": "error", "db": "connection_error", "details": str(e)}
+        return {"status": "error", "db": "failed", "details": str(e)}
+
+@app.post("/meetings")
+async def create_meeting(
+    bg: BackgroundTasks,
+    title: str = Form("Untitled"),
+    attendees: str = Form(""),
+    transcript: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+):
+    if not transcript and not file:
+        raise HTTPException(400, "Provide a transcript or an audio file")
+    mid = str(uuid.uuid4())
+    names = [a.strip() for a in attendees.split(",") if a.strip()]
+    path = None
+    if file:
+        path = os.path.join(tempfile.gettempdir(), f"{mid}_{file.filename}")
+        with open(path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+    with conn() as c:
+        row = c.execute(
+            "INSERT INTO meetings (id, title, attendees, transcript) VALUES (%s,%s,%s,%s) RETURNING meeting_date",
+            (mid, title, names, transcript)).fetchone()
+    audit(mid, "created", {"title": title})
+    bg.add_task(pipeline.run, mid, path, transcript, names, row["meeting_date"])
+    return {"id": mid}
+
+@app.get("/meetings")
+def list_meetings():
+    with conn() as c:
+        return c.execute(
+            "SELECT id, title, status, created_at FROM meetings ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+
+@app.get("/meetings/{mid}")
+def get_meeting(mid: str):
+    with conn() as c:
+        m = c.execute("SELECT * FROM meetings WHERE id=%s", (mid,)).fetchone()
+        if not m:
+            raise HTTPException(404, "Not found")
+        items = c.execute("SELECT * FROM action_items WHERE meeting_id=%s ORDER BY task", (mid,)).fetchall()
+    return {**m, "items": items}
+
+class Decision(BaseModel):
+    id: str
+    decision: Literal["approved", "rejected"]
+    task: str
+    owner: Optional[str] = None
+    due_date: Optional[str] = None
+
+@app.post("/meetings/{mid}/approve")
+def approve(mid: str, decisions: list[Decision], bg: BackgroundTasks):
+    with conn() as c:
+        m = c.execute("SELECT status FROM meetings WHERE id=%s", (mid,)).fetchone()
+        if not m:
+            raise HTTPException(404, "Not found")
+        if m["status"] != "awaiting_approval":
+            raise HTTPException(409, "Meeting is not awaiting approval")
+        for d in decisions:
+            c.execute(
+                "UPDATE action_items SET task=%s, owner=%s, due_date=%s::date, decision=%s "
+                "WHERE id=%s AND meeting_id=%s",
+                (d.task, d.owner, d.due_date or None, d.decision, d.id, mid))
+        c.execute("UPDATE meetings SET status='executing' WHERE id=%s", (mid,))  # blocks double-submit
+    audit(mid, "approved", {"approved": sum(d.decision == "approved" for d in decisions),
+                            "rejected": sum(d.decision == "rejected" for d in decisions)})
+    bg.add_task(pipeline.resume, mid, [d.model_dump() for d in decisions])
+    return {"ok": True}
