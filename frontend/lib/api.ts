@@ -49,4 +49,15 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(decisions),
     }).then((r) => json<{ ok: boolean }>(r)),
+  update: (
+    meetingId: string,
+    itemId: string,
+    body: { task: string; owner: string | null; due_date: string | null }
+  ) =>
+    fetch(`${BASE}/meetings/${meetingId}/items/${itemId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then((r) => json<{ ok: boolean }>(r)),
 };
+

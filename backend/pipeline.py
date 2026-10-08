@@ -10,6 +10,7 @@ from llm import Budget
 from extraction import extract
 from verify import verify
 from transcribe import transcribe
+from trello import build_notes
 
 GRAPH = None
 SERVER = os.path.join(os.path.dirname(__file__), "mcp_server.py")
@@ -51,6 +52,9 @@ def verify_node(s):
 
 def approve_node(s):
     mid = s["meeting_id"]
+    if not s["items"]:
+        audit(mid, "no_items")
+        return {"decisions": []}
     set_status(mid, "awaiting_approval")
     decisions = interrupt({"meeting_id": mid})       # pauses here; resumes with the value passed in
     audit(mid, "reviewed", {"count": len(decisions)})
@@ -64,7 +68,7 @@ async def _create_all(rows):
             for row in rows:
                 args = {
                     "title": row["task"],
-                    "notes": f"Owner: {row['owner'] or 'unassigned'}\nSource: \"{row['evidence_quote']}\"",
+                    "notes": build_notes(row["owner"], row["evidence_quote"]),
                 }
                 if row.get("due_date"):
                     args["due"] = row["due_date"].isoformat() if hasattr(row["due_date"], "isoformat") else str(row["due_date"])

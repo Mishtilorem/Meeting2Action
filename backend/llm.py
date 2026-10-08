@@ -6,8 +6,8 @@ from pydantic import ValidationError
 load_dotenv()
 client = Groq(api_key=os.environ.get("GROQ_API_KEY", ""))
 
-FAST = "llama-3.1-8b-instant"
-SMART = "llama-3.3-70b-versatile"   # model names change, check Groq's docs
+FAST = "openai/gpt-oss-20b"
+SMART = "openai/gpt-oss-120b"  
 
 class Budget:
     def __init__(self, limit):

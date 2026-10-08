@@ -1,4 +1,7 @@
 import os, uuid, shutil, tempfile
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+from datetime import date
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
 from dotenv import load_dotenv
@@ -11,18 +14,24 @@ from langgraph.checkpoint.postgres import PostgresSaver
 
 import pipeline
 from db import conn, audit
+from mcp_client import call_tool
+from trello import build_notes
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    db_url = os.environ.get("DATABASE_URL", "")
-    if db_url and "user:password" not in db_url:
-        with PostgresSaver.from_conn_string(db_url) as saver:
-            saver.setup()
-            pipeline.init(saver)
-            yield
-    else:
-        # Fallback for development before Postgres URL is added
-        yield
+async def lifespan(app):
+    pool = ConnectionPool(
+        conninfo=os.environ["DATABASE_URL"],
+        min_size=1,
+        max_size=5,
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+        check=ConnectionPool.check_connection,
+        open=True,
+    )
+    saver = PostgresSaver(pool)
+    saver.setup()
+    pipeline.init(saver)
+    yield
+    pool.close()
 
 app = FastAPI(title="Meeting-to-Action API", lifespan=lifespan)
 app.add_middleware(
@@ -114,3 +123,43 @@ def approve(mid: str, decisions: list[Decision], bg: BackgroundTasks):
                             "rejected": sum(d.decision == "rejected" for d in decisions)})
     bg.add_task(pipeline.resume, mid, [d.model_dump() for d in decisions])
     return {"ok": True}
+
+class ItemEdit(BaseModel):
+    task: str
+    owner: Optional[str] = None
+    due_date: Optional[date] = None
+
+@app.patch("/meetings/{mid}/items/{item_id}")
+def edit_item(mid: str, item_id: str, body: ItemEdit):
+    with conn() as c:
+        item = c.execute(
+            "SELECT * FROM action_items WHERE id=%s AND meeting_id=%s", (item_id, mid)
+        ).fetchone()
+    if not item:
+        raise HTTPException(404, "Item not found")
+    if not item["external_id"]:
+        raise HTTPException(409, "No card exists for this item yet")
+
+    args = {
+        "card_id": item["external_id"],
+        "title": body.task,
+        "notes": build_notes(body.owner, item["evidence_quote"]),
+    }
+    if body.due_date:
+        args["due"] = body.due_date.isoformat()
+
+    res = call_tool("update_task", args)          # Trello first
+    if res.isError:
+        raise HTTPException(502, f"Trello update failed: {res.content[0].text}")
+
+    with conn() as c:                             # then our database
+        c.execute(
+            "UPDATE action_items SET task=%s, owner=%s, due_date=%s WHERE id=%s",
+            (body.task, body.owner, body.due_date, item_id))
+    audit(mid, "item_edited", {
+        "item_id": item_id,
+        "before": {"task": item["task"], "owner": item["owner"], "due": str(item["due_date"])},
+        "after": {"task": body.task, "owner": body.owner, "due": str(body.due_date)},
+    })
+    return {"ok": True}
+
